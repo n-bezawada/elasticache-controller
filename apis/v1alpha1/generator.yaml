@@ -192,6 +192,11 @@ resources:
           is_ignored: true
       NetworkType:
         is_immutable: true
+      Durability:
+        set:
+          - ignore: from
+        compare: # removes the spec field from automatic delta comparison; see modifyDelta
+          is_ignored: true
     hooks:
       sdk_read_many_post_set_output:
         template_path: hooks/replication_group/sdk_read_many_post_set_output.go.tpl

@@ -28,6 +28,31 @@ from e2e.util import retrieve_cache_cluster, retrieve_replication_group, assert_
 
 RESOURCE_PLURAL = "replicationgroups"
 DEFAULT_WAIT_SECS = 120
+# Annotation the controller uses to record the durability value sent in the last successful
+# create or modify call. The Durability delta is computed against this rather than against
+# the AWS response, so it must be kept in sync -- see durabilityRequiresUpdate in hooks.go.
+LAST_REQUESTED_DURABILITY_ANNOTATION = "elasticache.services.k8s.aws/last-requested-durability"
+
+
+def assert_terminal_condition_from_aws(resource, expected_transition: str):
+    """Assert the resource is in a terminal condition raised by the AWS API itself.
+
+    Checking the message ensures the rejection was surfaced from the service rather than
+    reimplemented as a client-side validation, which would risk drifting from what AWS
+    actually allows. Client-side rejections in this controller are raised with a
+    "Please refer to Events for more details" message, so their absence is asserted too.
+    """
+    conditions = resource.get('status', {}).get('conditions', [])
+    terminal = next(
+        (c for c in conditions if c['type'] == 'ACK.Terminal'), None)
+    assert terminal is not None, \
+        f"Expected ACK.Terminal condition for {expected_transition} transition"
+    assert terminal['status'] == 'True'
+    message = terminal.get('message', '')
+    assert "InvalidParameter" in message, \
+        f"Expected an AWS InvalidParameter* error for {expected_transition}, got: {message}"
+    assert "Please refer to Events for more details" not in message, \
+        f"{expected_transition} was rejected client-side rather than by AWS: {message}"
 
 
 @pytest.fixture(scope="module")
@@ -361,6 +386,73 @@ class TestReplicationGroup:
             assert resource['status'].get('effectiveDurability') == "sync"
             rg = retrieve_replication_group(rg_id)
             assert rg['Durability'] == "sync"
+
+            # The controller records the requested durability in an annotation and computes
+            # the Durability delta against it, since the AWS response is not used to
+            # populate spec.durability. If the annotation is not refreshed after a
+            # successful modify, the same delta is re-detected on every reconcile and
+            # ModifyReplicationGroup is re-sent forever without ever converging.
+            annotations = resource['metadata'].get('annotations', {})
+            assert annotations.get(LAST_REQUESTED_DURABILITY_ANNOTATION) == "sync", \
+                "last-requested-durability annotation was not refreshed after modify; " \
+                "the resource will never converge"
+
+            # Confirm the resource stays converged rather than flapping back into a
+            # modifying state on a later reconcile. Any flap re-transitions the synced
+            # condition, so an unchanged lastTransitionTime proves it held steady.
+            synced = k8s.get_resource_condition(reference, "ACK.ResourceSynced")
+            assert synced is not None and synced['status'] == "True"
+            synced_at = synced.get('lastTransitionTime')
+            sleep(DEFAULT_WAIT_SECS)
+            synced = k8s.get_resource_condition(reference, "ACK.ResourceSynced")
+            assert synced is not None and synced['status'] == "True", \
+                "resource did not stay synced after the durability update converged"
+            assert synced.get('lastTransitionTime') == synced_at, \
+                "resource left the synced state after the durability update converged"
+        finally:
+            k8s.delete_custom_resource(reference)
+            sleep(DEFAULT_WAIT_SECS)
+            rg_deletion_waiter.wait(ReplicationGroupId=rg_id)
+
+    def test_rg_durability_unset(self, make_rg_name, make_replication_group, rg_deletion_waiter):
+        """Verify that removing durability from the spec is treated as leaving the field
+        unmanaged. AWS offers no way to unset durability, so there is nothing to request:
+        the resource must stay synced rather than repeatedly attempting an empty modify or
+        being rejected as a terminal error."""
+        rg_id = make_rg_name("rg-durability-unset")
+        input_dict = {"RG_ID": rg_id, "DURABILITY": "async"}
+
+        (reference, _) = make_replication_group(
+            "replicationgroup_durability", input_dict, rg_id)
+
+        try:
+            assert k8s.wait_on_condition(
+                reference, "ACK.ResourceSynced", "True", wait_periods=90)
+
+            resource = k8s.get_resource(reference)
+            assert resource['spec']['durability'] == "async"
+
+            # Remove durability from the spec. A merge patch requires an explicit null to
+            # delete the field rather than leaving it untouched.
+            _ = k8s.patch_custom_resource(reference, {"spec": {"durability": None}})
+            sleep(DEFAULT_WAIT_SECS)
+
+            resource = k8s.get_resource(reference)
+            assert resource['spec'].get('durability') is None
+
+            # Removing the field must not raise a terminal condition, and must not leave the
+            # resource permanently out of sync attempting a modify it cannot express.
+            conditions = resource.get('status', {}).get('conditions', [])
+            terminal = next(
+                (c for c in conditions if c['type'] == 'ACK.Terminal'), None)
+            assert terminal is None or terminal['status'] != 'True', \
+                f"removing durability should not be terminal: {terminal}"
+            assert k8s.wait_on_condition(
+                reference, "ACK.ResourceSynced", "True", wait_periods=30)
+
+            # The durability already applied to the replication group is left as-is.
+            rg = retrieve_replication_group(rg_id)
+            assert rg['Durability'] == "async"
         finally:
             k8s.delete_custom_resource(reference)
             sleep(DEFAULT_WAIT_SECS)
@@ -391,11 +483,11 @@ class TestReplicationGroup:
                 reference, "ACK.Terminal", "True", wait_periods=30)
 
             resource = k8s.get_resource(reference)
-            conditions = resource.get('status', {}).get('conditions', [])
-            terminal = next(
-                (c for c in conditions if c['type'] == 'ACK.Terminal'), None)
-            assert terminal is not None, "Expected ACK.Terminal condition for async->disabled transition"
-            assert terminal['status'] == 'True'
+            assert_terminal_condition_from_aws(resource, "async->disabled")
+
+            # The rejected transition must not have altered the AWS-side resource.
+            rg = retrieve_replication_group(rg_id)
+            assert rg['Durability'] == "async"
         finally:
             k8s.delete_custom_resource(reference)
             sleep(DEFAULT_WAIT_SECS)
@@ -429,11 +521,11 @@ class TestReplicationGroup:
                 reference, "ACK.Terminal", "True", wait_periods=30)
 
             resource = k8s.get_resource(reference)
-            conditions = resource.get('status', {}).get('conditions', [])
-            terminal = next(
-                (c for c in conditions if c['type'] == 'ACK.Terminal'), None)
-            assert terminal is not None, "Expected ACK.Terminal condition for default->sync transition"
-            assert terminal['status'] == 'True'
+            assert_terminal_condition_from_aws(resource, "default->sync")
+
+            # The rejected transition must not have altered the AWS-side resource.
+            rg = retrieve_replication_group(rg_id)
+            assert rg['Durability'] == "default"
         finally:
             k8s.delete_custom_resource(reference)
             sleep(DEFAULT_WAIT_SECS)
