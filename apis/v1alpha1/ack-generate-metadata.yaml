@@ -5,7 +5,7 @@ ack_generate_info:
   version: v0.62.1
 api_directory_checksum: 548287fa7e8f6bf6cc59eda33468e5e72cc72caf
 api_version: v1alpha1
-aws_sdk_go_version: v1.41.0
+aws_sdk_go_version: v1.41.10
 generator_config_info:
   file_checksum: 03e9653b96b750ed96019c35ad53b18b63644e4f
   original_file_name: generator.yaml
