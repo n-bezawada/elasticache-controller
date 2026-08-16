@@ -411,6 +411,10 @@ type ReplicationGroupStatus struct {
 	// Global datastore.
 	// +kubebuilder:validation:Optional
 	GlobalReplicationGroupInfo *GlobalReplicationGroupInfo `json:"globalReplicationGroupInfo,omitempty"`
+	// The durability setting of the replication group. For more information, see
+	// Durability (http://docs.aws.amazon.com/AmazonElastiCache/latest/dg/Durability.html).
+	// +kubebuilder:validation:Optional
+	LastRequestedDurability *string `json:"lastRequestedDurability,omitempty"`
 	// Returns the destination, format and type of the logs.
 	// +kubebuilder:validation:Optional
 	LogDeliveryConfigurations []*LogDeliveryConfiguration `json:"logDeliveryConfigurations,omitempty"`

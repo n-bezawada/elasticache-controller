@@ -28,10 +28,6 @@ from e2e.util import retrieve_cache_cluster, retrieve_replication_group, assert_
 
 RESOURCE_PLURAL = "replicationgroups"
 DEFAULT_WAIT_SECS = 120
-# Annotation the controller uses to record the durability value sent in the last successful
-# create or modify call. The Durability delta is computed against this rather than against
-# the AWS response, so it must be kept in sync -- see durabilityRequiresUpdate in hooks.go.
-LAST_REQUESTED_DURABILITY_ANNOTATION = "elasticache.services.k8s.aws/last-requested-durability"
 
 
 def assert_terminal_condition_from_aws(resource, expected_transition: str):
@@ -59,6 +55,11 @@ def assert_terminal_condition_from_aws(resource, expected_transition: str):
 def rg_deletion_waiter():
     ec = boto3.client("elasticache")
     return ec.get_waiter('replication_group_deleted')
+
+
+@pytest.fixture(scope="module")
+def elasticache_client():
+    return boto3.client('elasticache')
 
 
 # retrieve resources created in the bootstrap step
@@ -387,14 +388,12 @@ class TestReplicationGroup:
             rg = retrieve_replication_group(rg_id)
             assert rg['Durability'] == "sync"
 
-            # The controller records the requested durability in an annotation and computes
-            # the Durability delta against it, since the AWS response is not used to
-            # populate spec.durability. If the annotation is not refreshed after a
-            # successful modify, the same delta is re-detected on every reconcile and
-            # ModifyReplicationGroup is re-sent forever without ever converging.
-            annotations = resource['metadata'].get('annotations', {})
-            assert annotations.get(LAST_REQUESTED_DURABILITY_ANNOTATION) == "sync", \
-                "last-requested-durability annotation was not refreshed after modify; " \
+            # The Durability delta is computed against the durability the API reports, held
+            # in status.lastRequestedDurability, since the response is not used to populate
+            # spec.durability. If it does not track the API, the same delta is re-detected
+            # on every reconcile and ModifyReplicationGroup is re-sent without converging.
+            assert resource['status'].get('lastRequestedDurability') == "sync", \
+                "status.lastRequestedDurability did not track the API after modify; " \
                 "the resource will never converge"
 
             # Confirm the resource stays converged rather than flapping back into a
@@ -409,6 +408,50 @@ class TestReplicationGroup:
                 "resource did not stay synced after the durability update converged"
             assert synced.get('lastTransitionTime') == synced_at, \
                 "resource left the synced state after the durability update converged"
+        finally:
+            k8s.delete_custom_resource(reference)
+            sleep(DEFAULT_WAIT_SECS)
+            rg_deletion_waiter.wait(ReplicationGroupId=rg_id)
+
+    def test_rg_durability_drift(self, make_rg_name, make_replication_group, rg_deletion_waiter, elasticache_client):
+        """Verify that a durability change made outside of ACK is detected and corrected.
+
+        The durability difference is computed against the value the API reports, so the
+        change is observed on the next reconcile and the value declared in the spec is
+        re-applied. Note the controller does not poll for drift: it reconciles on its resync
+        interval or when the resource changes, so this test edits an unrelated field to
+        trigger a reconcile rather than waiting for the resync."""
+        rg_id = make_rg_name("rg-durability-drift")
+        input_dict = {"RG_ID": rg_id, "DURABILITY": "sync"}
+
+        (reference, _) = make_replication_group(
+            "replicationgroup_durability", input_dict, rg_id)
+
+        try:
+            assert k8s.wait_on_condition(
+                reference, "ACK.ResourceSynced", "True", wait_periods=90)
+            assert retrieve_replication_group(rg_id)['Durability'] == "sync"
+
+            # Change durability behind the controller's back.
+            elasticache_client.modify_replication_group(
+                ReplicationGroupId=rg_id, Durability="async", ApplyImmediately=True)
+            sleep(DEFAULT_WAIT_SECS)
+            assert retrieve_replication_group(rg_id)['Durability'] == "async"
+
+            # Edit an unrelated field to trigger a reconcile.
+            _ = k8s.patch_custom_resource(
+                reference, {"spec": {"description": "durability drift test"}})
+            sleep(DEFAULT_WAIT_SECS)
+
+            # The controller must notice and restore the durability declared in the spec.
+            assert k8s.wait_on_condition(
+                reference, "ACK.ResourceSynced", "True", wait_periods=90)
+            resource = k8s.get_resource(reference)
+            assert resource['spec']['durability'] == "sync"
+            assert resource['status'].get('lastRequestedDurability') == "sync"
+            rg = retrieve_replication_group(rg_id)
+            assert rg['Durability'] == "sync", \
+                f"out-of-band durability change was not corrected: {rg['Durability']}"
         finally:
             k8s.delete_custom_resource(reference)
             sleep(DEFAULT_WAIT_SECS)

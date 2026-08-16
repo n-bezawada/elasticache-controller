@@ -53,9 +53,6 @@ const (
 	// NodeGroupConfiguration structs passed in as input to either the create or modify API called most
 	// recently
 	AnnotationLastRequestedNGC = svcapitypes.AnnotationPrefix + "last-requested-node-group-configuration"
-	// AnnotationLastRequestedDurability is an annotation whose value is passed in as input to either
-	// the create or modify API called most recently
-	AnnotationLastRequestedDurability = svcapitypes.AnnotationPrefix + "last-requested-durability"
 )
 
 var (
@@ -204,6 +201,17 @@ func (rm *resourceManager) customSetOutput(
 ) {
 	if ko.Status.Conditions == nil {
 		ko.Status.Conditions = []*ackv1alpha1.Condition{}
+	}
+
+	// The API reports the durability it holds for the replication group, unresolved: a group
+	// created with "default" reads back "default", while Status.EffectiveDurability holds the
+	// value the service resolved it to. Spec.Durability is deliberately never populated from
+	// the response, so this is what the durability difference is computed against -- see
+	// durabilityRequiresUpdate.
+	if respRG.Durability != "" {
+		ko.Status.LastRequestedDurability = aws.String(string(respRG.Durability))
+	} else {
+		ko.Status.LastRequestedDurability = nil
 	}
 
 	allNodeGroupsAvailable := true
@@ -398,7 +406,6 @@ func (rm *resourceManager) setAnnotationsFields(
 
 	rm.setLastRequestedLogDeliveryConfigurations(r, annotations)
 	rm.setLastRequestedCacheNodeType(r, annotations)
-	rm.setLastRequestedDurability(r, annotations)
 	ko.ObjectMeta.Annotations = annotations
 }
 
@@ -445,35 +452,6 @@ func (rm *resourceManager) setLastRequestedCacheNodeType(
 	if r.ko.Spec.CacheNodeType != nil {
 		annotations[AnnotationLastRequestedCNT] = *r.ko.Spec.CacheNodeType
 	}
-}
-
-// setLastRequestedDurability copies desired.Spec.Durability into the annotation
-// of the object.
-func (rm *resourceManager) setLastRequestedDurability(
-	r *resource,
-	annotations map[string]string,
-) {
-	if r.ko.Spec.Durability != nil {
-		annotations[AnnotationLastRequestedDurability] = *r.ko.Spec.Durability
-	}
-}
-
-// refreshLastRequestedDurability updates the last requested durability annotation on ko after
-// a successful modify call. The delta for Durability is computed against this annotation,
-// because latest.Spec.Durability is never populated from the AWS response (see the Durability
-// field config in generator.yaml). It is refreshed here rather than in setAnnotationsFields
-// because modifyReplicationGroup returns the modified resource directly and so never reaches
-// CustomModifyReplicationGroupSetOutput. Only durability is refreshed, as the other last
-// requested annotations track fields that method does not send to AWS. Note the caller must
-// return a nil error for this to be persisted: the runtime skips patching metadata when
-// Update returns an error.
-func (rm *resourceManager) refreshLastRequestedDurability(
-	desired *resource,
-	ko *svcapitypes.ReplicationGroup,
-) {
-	annotations := getAnnotationsFields(desired, ko)
-	rm.setLastRequestedDurability(desired, annotations)
-	ko.ObjectMeta.Annotations = annotations
 }
 
 // setLastRequestedNodeGroupConfiguration copies desired.spec.NodeGroupConfiguration into the
@@ -660,7 +638,7 @@ func (rm *resourceManager) modifyReplicationGroup(
 			return nil, respErr
 		}
 
-		// The ModifyReplicationGroup API returns stale field Engine that don't
+		// The ModifyReplicationGroup API returns stale fields Engine and Durability that don't
 		// immediately reflect the requested changes, causing the controller to detect false
 		// differences and trigger terminal conditions. Override these fields with the user's
 		// intended values before passing to the generated setReplicationGroupOutput function.
@@ -670,6 +648,12 @@ func (rm *resourceManager) modifyReplicationGroup(
 		}
 		durabilityModified := delta.DifferentAt("Spec.Durability")
 		if durabilityModified {
+			if desired.ko.Spec.Durability != nil {
+				// Without this the durability just accepted by AWS would be reported as the
+				// previous value until the next read, both in status and in the difference
+				// computed on the following reconcile.
+				normalizedRG.Durability = svcsdktypes.Durability(*desired.ko.Spec.Durability)
+			}
 			// The response can still report the replication group as available until the
 			// service picks up the durability change, which would mark the resource synced
 			// before Status.EffectiveDurability reflects it. Reporting the modify that AWS
@@ -681,10 +665,6 @@ func (rm *resourceManager) modifyReplicationGroup(
 		res, err := rm.setReplicationGroupOutput(ctx, desired, &normalizedRG)
 		if err != nil {
 			return res, err
-		}
-		if durabilityModified && res != nil {
-			// Update the annotation since the API call was successful
-			rm.refreshLastRequestedDurability(desired, res.ko)
 		}
 		return res, nil
 	}
@@ -1243,8 +1223,8 @@ func (rm *resourceManager) newModifyReplicationGroupRequestPayload(
 		input.CacheParameterGroupName = desired.ko.Spec.CacheParameterGroupName
 	}
 
-	// the delta for this field is computed against the last requested durability saved in
-	// annotations -- see durabilityRequiresUpdate
+	// the delta for this field is computed against the durability reported by the API in
+	// Status.LastRequestedDurability -- see durabilityRequiresUpdate
 	if delta.DifferentAt("Spec.Durability") &&
 		desired.ko.Spec.Durability != nil {
 		input.Durability = svcsdktypes.Durability(*desired.ko.Spec.Durability)
@@ -1457,11 +1437,11 @@ func modifyDelta(
 			unmarshalLastRequestedLDCs(desired))
 	}
 
-	// note that the comparison is actually done between desired.Spec.Durability and the last
-	// requested durability saved in annotations (as opposed to latest.Spec.Durability, which is
-	// never set from the AWS response -- see the Durability field config in generator.yaml)
-	if durabilityRequiresUpdate(desired) {
-		delta.Add("Spec.Durability", desired.ko.Spec.Durability, lastRequestedDurability(desired))
+	// note that the comparison is done against latest.Status.LastRequestedDurability, the
+	// durability reported by the API, as opposed to latest.Spec.Durability, which is never set
+	// from the AWS response -- see the Durability field config in generator.yaml
+	if durabilityRequiresUpdate(desired, latest) {
+		delta.Add("Spec.Durability", desired.ko.Spec.Durability, latest.ko.Status.LastRequestedDurability)
 	}
 
 	if multiAZRequiresUpdate(desired, latest) {
@@ -1499,26 +1479,21 @@ func unmarshalLastRequestedLDCs(desired *resource) []*svcapitypes.LogDeliveryCon
 	return lastRequestedConfigs
 }
 
-// durabilityRequiresUpdate retrieves the last requested durability saved in annotations and
-// compares it to the current desired durability. A nil desired durability means the user is
-// not managing the field: AWS offers no way to "unset" durability, so there is nothing to
-// request and no update is required.
-func durabilityRequiresUpdate(desired *resource) bool {
+// durabilityRequiresUpdate compares the desired durability against the durability the API
+// reports for the replication group, held in Status.LastRequestedDurability. A nil desired
+// durability means the user is not managing the field: AWS offers no way to "unset"
+// durability, so there is nothing to request and no update is required.
+func durabilityRequiresUpdate(desired *resource, latest *resource) bool {
 	if desired.ko.Spec.Durability == nil {
 		return false
 	}
-	lastRequested := lastRequestedDurability(desired)
-	return lastRequested == nil || *lastRequested != *desired.ko.Spec.Durability
-}
 
-// lastRequestedDurability returns the durability value requested in the last successful create
-// or modify call, as saved in annotations
-func lastRequestedDurability(desired *resource) *string {
-	annotations := desired.ko.ObjectMeta.GetAnnotations()
-	if val, ok := annotations[AnnotationLastRequestedDurability]; ok {
-		return &val
+	// API should return a non-nil value, but if it doesn't then attempt to update
+	if latest.ko.Status.LastRequestedDurability == nil {
+		return true
 	}
-	return nil
+
+	return *latest.ko.Status.LastRequestedDurability != *desired.ko.Spec.Durability
 }
 
 // multiAZRequiresUpdate returns true if the latest multi AZ status does not yet match the

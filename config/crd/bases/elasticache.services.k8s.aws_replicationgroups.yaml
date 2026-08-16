@@ -816,6 +816,11 @@ spec:
                   globalReplicationGroupMemberRole:
                     type: string
                 type: object
+              lastRequestedDurability:
+                description: |-
+                  The durability setting of the replication group. For more information, see
+                  Durability (http://docs.aws.amazon.com/AmazonElastiCache/latest/dg/Durability.html).
+                type: string
               logDeliveryConfigurations:
                 description: Returns the destination, format and type of the logs.
                 items:
