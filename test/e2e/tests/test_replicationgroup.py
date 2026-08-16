@@ -504,8 +504,10 @@ class TestReplicationGroup:
     def test_rg_durability_disabled_guard(self, make_rg_name, make_replication_group, rg_deletion_waiter):
         """Verify that patching durability to 'disabled' is rejected by AWS as a terminal
         error (InvalidParameterCombination/InvalidParameterValue -- both in terminal_codes),
-        rather than retried forever. Durability enabled/disabled state is fixed at creation
-        and AWS does not support changing it; this is enforced by the service itself."""
+        rather than retried forever. Durability cannot be disabled once a replication group
+        has been created with it enabled, which the service enforces itself: the API returns
+        "Durability cannot currently be disabled on durable clusters". Note the durability
+        mode may still be changed within the enabled values, async to sync and back."""
         rg_id = make_rg_name("rg-durability-guard")
         input_dict = {"RG_ID": rg_id, "DURABILITY": "async"}
 
@@ -537,11 +539,13 @@ class TestReplicationGroup:
             rg_deletion_waiter.wait(ReplicationGroupId=rg_id)
 
     def test_rg_durability_default_guard(self, make_rg_name, make_replication_group, rg_deletion_waiter):
-        """Verify that patching durability away from 'default' is rejected by AWS as a
-        terminal error, rather than being silently ignored. AWS's Durability field is not
-        resolved server-side -- a cluster created with "default" reads back "default"
-        indefinitely (only status.effectiveDurability resolves), so this transition must be
-        detected and sent to AWS, which rejects enabling durability post-creation itself."""
+        """Verify that patching durability from 'default' to an enabled value is rejected by
+        AWS as a terminal error, rather than being silently ignored. A replication group
+        created with "default" reads back "default" indefinitely, since the API reports the
+        requested value and only status.effectiveDurability holds the value the service
+        resolved it to, so this difference must be detected and sent to AWS. The service
+        treats "default" as non-durable and returns "Durability cannot currently be enabled
+        on non-durable clusters"."""
         rg_id = make_rg_name("rg-durability-default-guard")
         input_dict = {"RG_ID": rg_id, "DURABILITY": "default"}
 
