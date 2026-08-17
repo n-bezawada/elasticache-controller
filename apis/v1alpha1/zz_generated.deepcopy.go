@@ -3111,11 +3111,6 @@ func (in *ReplicationGroupStatus) DeepCopyInto(out *ReplicationGroupStatus) {
 		*out = new(GlobalReplicationGroupInfo)
 		(*in).DeepCopyInto(*out)
 	}
-	if in.LastRequestedDurability != nil {
-		in, out := &in.LastRequestedDurability, &out.LastRequestedDurability
-		*out = new(string)
-		**out = **in
-	}
 	if in.LogDeliveryConfigurations != nil {
 		in, out := &in.LogDeliveryConfigurations, &out.LogDeliveryConfigurations
 		*out = make([]*LogDeliveryConfiguration, len(*in))
@@ -3164,6 +3159,11 @@ func (in *ReplicationGroupStatus) DeepCopyInto(out *ReplicationGroupStatus) {
 				(*in).DeepCopyInto(*out)
 			}
 		}
+	}
+	if in.ObservedDurability != nil {
+		in, out := &in.ObservedDurability, &out.ObservedDurability
+		*out = new(string)
+		**out = **in
 	}
 	if in.PendingModifiedValues != nil {
 		in, out := &in.PendingModifiedValues, &out.PendingModifiedValues

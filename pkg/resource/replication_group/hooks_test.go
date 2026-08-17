@@ -32,7 +32,7 @@ func newDurabilityResources(desired *string, lastRequested *string) (*resource, 
 	l := &resource{
 		ko: &svcapitypes.ReplicationGroup{
 			Status: svcapitypes.ReplicationGroupStatus{
-				LastRequestedDurability: lastRequested,
+				ObservedDurability: lastRequested,
 			},
 		},
 	}

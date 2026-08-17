@@ -209,9 +209,9 @@ func (rm *resourceManager) customSetOutput(
 	// the response, so this is what the durability difference is computed against -- see
 	// durabilityRequiresUpdate.
 	if respRG.Durability != "" {
-		ko.Status.LastRequestedDurability = aws.String(string(respRG.Durability))
+		ko.Status.ObservedDurability = aws.String(string(respRG.Durability))
 	} else {
-		ko.Status.LastRequestedDurability = nil
+		ko.Status.ObservedDurability = nil
 	}
 
 	allNodeGroupsAvailable := true
@@ -1224,7 +1224,7 @@ func (rm *resourceManager) newModifyReplicationGroupRequestPayload(
 	}
 
 	// the delta for this field is computed against the durability reported by the API in
-	// Status.LastRequestedDurability -- see durabilityRequiresUpdate
+	// Status.ObservedDurability -- see durabilityRequiresUpdate
 	if delta.DifferentAt("Spec.Durability") &&
 		desired.ko.Spec.Durability != nil {
 		input.Durability = svcsdktypes.Durability(*desired.ko.Spec.Durability)
@@ -1437,11 +1437,11 @@ func modifyDelta(
 			unmarshalLastRequestedLDCs(desired))
 	}
 
-	// note that the comparison is done against latest.Status.LastRequestedDurability, the
+	// note that the comparison is done against latest.Status.ObservedDurability, the
 	// durability reported by the API, as opposed to latest.Spec.Durability, which is never set
 	// from the AWS response -- see the Durability field config in generator.yaml
 	if durabilityRequiresUpdate(desired, latest) {
-		delta.Add("Spec.Durability", desired.ko.Spec.Durability, latest.ko.Status.LastRequestedDurability)
+		delta.Add("Spec.Durability", desired.ko.Spec.Durability, latest.ko.Status.ObservedDurability)
 	}
 
 	if multiAZRequiresUpdate(desired, latest) {
@@ -1480,7 +1480,7 @@ func unmarshalLastRequestedLDCs(desired *resource) []*svcapitypes.LogDeliveryCon
 }
 
 // durabilityRequiresUpdate compares the desired durability against the durability the API
-// reports for the replication group, held in Status.LastRequestedDurability. A nil desired
+// reports for the replication group, held in Status.ObservedDurability. A nil desired
 // durability means the user is not managing the field: AWS offers no way to "unset"
 // durability, so there is nothing to request and no update is required.
 func durabilityRequiresUpdate(desired *resource, latest *resource) bool {
@@ -1489,11 +1489,11 @@ func durabilityRequiresUpdate(desired *resource, latest *resource) bool {
 	}
 
 	// API should return a non-nil value, but if it doesn't then attempt to update
-	if latest.ko.Status.LastRequestedDurability == nil {
+	if latest.ko.Status.ObservedDurability == nil {
 		return true
 	}
 
-	return *latest.ko.Status.LastRequestedDurability != *desired.ko.Spec.Durability
+	return *latest.ko.Status.ObservedDurability != *desired.ko.Spec.Durability
 }
 
 // multiAZRequiresUpdate returns true if the latest multi AZ status does not yet match the
